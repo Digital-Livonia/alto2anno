@@ -14,6 +14,11 @@ record, live elsewhere and are out of scope here):
 4. Upload each JSON file back to Directus (`POST /files`).
 5. `POST` the resulting file ids to the caller-supplied `callback_url`.
 
+Steps 1 and 4 are two Directus Flows (built via the API, not stored as
+files) -- see **`FLOWS.md`** for their exact structure and, importantly,
+the full map of every token/service-account this system needs and what
+permissions each one requires.
+
 ## `POST /convert`
 
 ### Auth
@@ -97,7 +102,7 @@ file in the batch.
 |---|---|---|
 | `ANNOTATOR_SHARED_SECRET` | yes | Bearer token this service requires on incoming `/convert` requests. |
 | `DIRECTUS_URL` | yes | Base URL of the Directus instance, no trailing slash (e.g. `https://db.dl.tlu.ee`). |
-| `DIRECTUS_SERVICE_TOKEN` | yes | Bearer token for a Directus service account, used for `GET /assets/:id` and `POST /files`. |
+| `DIRECTUS_SERVICE_TOKEN` | yes | Bearer token for a Directus service account, used for `GET /assets/:id` and `POST /files`. Needs `directus_files` Read + Create -- see `FLOWS.md` for the full token/permission map, including the *other* tokens this same account's token gets reused for (Flow A's `callback_token`, Flow B's `check_auth`). |
 | `ALTO2ANNO_XSL_PATH` | no | Overrides the XSL stylesheet path. Defaults to `annotationListNoArt.xsl` next to `alto2anno.py` in the repo root. |
 | `ALTO2ANNO_SCRIPT_PATH` | no | Overrides the path to `alto2anno.py`. Defaults to the copy in the repo root. |
 | `PYTHON_EXECUTABLE` | no | Interpreter used to invoke `alto2anno.py`. Defaults to the interpreter running this service. |
