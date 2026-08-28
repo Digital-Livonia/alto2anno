@@ -25,18 +25,24 @@ async def fetch_asset(client: httpx.AsyncClient, file_id: str) -> httpx.Response
     return response
 
 
-async def upload_file(client: httpx.AsyncClient, file_path: Path) -> str:
+async def upload_file(client: httpx.AsyncClient, file_path: Path, upload_filename: str | None = None) -> str:
     """POST a local file to Directus's /files endpoint (multipart/form-data).
 
     This single call both stores the file on Directus's configured storage
     and creates the corresponding directus_files record, which is why it's
     used here instead of writing to shared storage directly.
 
+    `upload_filename` overrides the filename Directus stores (defaults to
+    the local file's own name) -- needed because the on-disk name may carry
+    an internal ordering prefix that shouldn't leak into the uploaded
+    file's name. See utils.strip_index_prefix().
+
     Returns the new file's id.
     """
     url = f"{settings.directus_url}/files"
+    name = upload_filename or file_path.name
     with open(file_path, "rb") as fh:
-        files = {"file": (file_path.name, fh, "application/json")}
+        files = {"file": (name, fh, "application/json")}
         response = await client.post(
             url, headers=_auth_headers(), files=files, timeout=settings.http_timeout_seconds
         )

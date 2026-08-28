@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 _FILENAME_RE = re.compile(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', re.IGNORECASE)
+_INDEX_PREFIX_RE = re.compile(r'^\d{4}_')
 
 
 def filename_from_content_disposition(header_value: str | None) -> str | None:
@@ -40,3 +41,19 @@ def derive_filename(index: int, file_id: str, content_disposition: str | None) -
     if not base.lower().endswith(".xml"):
         base += ".xml"
     return f"{index:04d}_{base}"
+
+
+def strip_index_prefix(stem: str) -> str:
+    """Reverse the zero-padded index prefix derive_filename() adds.
+
+    Found via a real bug: this project's ALTO/image filenames already
+    carry their own "NNNN_" ordering prefix (e.g. "0001_001.xml" /
+    "0001_001.jpg"), so prepending our own index on top produced
+    "0001_0001_001.json" for the converted output -- which no longer
+    matched the canvas image's filename stem ("0001_001"), silently
+    breaking the manifest's annotation-to-canvas matching in
+    directus-iiif-endpoint's getAnnotations() (it looks for an exact
+    `${stem}.json`). The uploaded output filename must be built from this
+    stripped stem, not the prefixed one used to drive alto2anno.py's sort.
+    """
+    return _INDEX_PREFIX_RE.sub('', stem, count=1)

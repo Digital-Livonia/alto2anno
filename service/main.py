@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field, field_validator
 from .config import settings
 from .converter import ConversionError, run_alto2anno
 from .directus import fetch_asset, upload_file
-from .utils import derive_filename
+from .utils import derive_filename, strip_index_prefix
 
 logger = logging.getLogger("alto2anno.service")
 
@@ -151,8 +151,14 @@ async def convert(payload: ConvertRequest) -> ConvertResponse:
             annotation_file_ids: list[str] = []
             for stem in input_stems:
                 json_path = tmp_path / f"{stem}.json"
+                # Upload under the original (un-prefixed) name -- the index
+                # prefix only exists to force alto2anno.py's alphabetical
+                # sort order and must not leak into the stored filename,
+                # since directus-iiif-endpoint's getAnnotations() matches
+                # annotation files to canvases by exact filename stem.
+                upload_filename = f"{strip_index_prefix(stem)}.json"
                 try:
-                    file_id = await upload_file(client, json_path)
+                    file_id = await upload_file(client, json_path, upload_filename=upload_filename)
                 except httpx.HTTPError as exc:
                     logger.error("Failed to upload %s to Directus: %s", json_path.name, exc)
                     raise HTTPException(

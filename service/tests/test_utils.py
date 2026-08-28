@@ -6,7 +6,7 @@ the service_env fixture.
 """
 from __future__ import annotations
 
-from service.utils import derive_filename, filename_from_content_disposition
+from service.utils import derive_filename, filename_from_content_disposition, strip_index_prefix
 
 
 class TestFilenameFromContentDisposition:
@@ -94,3 +94,32 @@ class TestDeriveFilename:
         assert name_2 == "0002_id-2.xml"
         assert name_10 == "0010_id-10.xml"
         assert sorted([name_10, name_2]) == [name_2, name_10]
+
+
+class TestStripIndexPrefix:
+    def test_strips_leading_four_digit_index(self):
+        assert strip_index_prefix("0001_page1") == "page1"
+
+    def test_regression_original_filename_already_carries_its_own_prefix(self):
+        # Real bug: this project's ALTO/image filenames already carry their
+        # own "NNNN_" ordering prefix (e.g. "0001_001.xml" alongside a
+        # canvas image "0001_001.jpg"). derive_filename() then prepends a
+        # second one ("0001_0001_001.xml"), and if that prefixed stem were
+        # used as the uploaded output's filename too, it would no longer
+        # match the image's filename stem -- silently breaking
+        # directus-iiif-endpoint's getAnnotations() matching. Only the
+        # first (our own) prefix must come off.
+        derived = derive_filename(1, "file-id", 'attachment; filename="0001_001.xml"')
+        assert derived == "0001_0001_001.xml"
+        stem = derived.removesuffix(".xml")
+        assert strip_index_prefix(stem) == "0001_001"
+
+    def test_leaves_non_four_digit_leading_numbers_alone(self):
+        # Only strips a prefix shaped exactly like what derive_filename()
+        # adds (exactly 4 digits + underscore); anything else is left
+        # as-is rather than guessed at.
+        assert strip_index_prefix("1_page") == "1_page"
+        assert strip_index_prefix("page1") == "page1"
+
+    def test_no_op_when_no_prefix_present(self):
+        assert strip_index_prefix("original") == "original"

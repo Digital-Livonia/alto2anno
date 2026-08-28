@@ -200,6 +200,50 @@ class TestHappyPath:
         first_upload_body = upload_requests[0].content
         assert b'"@type":"sc:AnnotationList"' in first_upload_body
 
+        # The uploaded filename must be the original stem, not the
+        # "000N_"-prefixed one used on disk to force alto2anno.py's sort
+        # order -- see test below for why (directus-iiif-endpoint matches
+        # annotation files to canvas images by exact filename stem).
+        assert b'filename="sample_page_a.json"' in first_upload_body
+        assert b'filename="0001_sample_page_a.json"' not in first_upload_body
+
+    def test_uploaded_filename_strips_our_index_prefix_even_when_original_already_has_one(
+        self, client, auth_headers, valid_payload, httpx_mock
+    ):
+        # Regression test for a real bug: this project's ALTO/image files
+        # already carry their own "NNNN_" ordering prefix in their real
+        # filenames (e.g. "0001_001.xml" alongside canvas image
+        # "0001_001.jpg"). derive_filename() prepends a second index on
+        # top ("0001_0001_001.xml"), and the *uploaded* filename must not
+        # keep that -- it has to come back out as "0001_001.json" so it
+        # still matches the canvas image's filename stem.
+        file_id = valid_payload["alto_file_ids"][0]
+        fixture_path = FIXTURES_DIR / "sample_page_a.xml"
+        httpx_mock.add_response(
+            url=_asset_url(file_id),
+            content=fixture_path.read_bytes(),
+            headers={"content-disposition": 'attachment; filename="0001_001.xml"'},
+        )
+        # Second file can be anything valid; not the focus of this test.
+        other_id = valid_payload["alto_file_ids"][1]
+        httpx_mock.add_response(
+            url=_asset_url(other_id),
+            content=(FIXTURES_DIR / "sample_page_b.xml").read_bytes(),
+            headers={"content-disposition": 'attachment; filename="0002_002.xml"'},
+        )
+        httpx_mock.add_response(url=_files_url(), method="POST", json={"data": {"id": "new-1"}})
+        httpx_mock.add_response(url=_files_url(), method="POST", json={"data": {"id": "new-2"}})
+        httpx_mock.add_response(url=valid_payload["callback_url"], method="POST", json={"ok": True})
+
+        response = client.post("/convert", json=valid_payload, headers=auth_headers)
+
+        assert response.status_code == 200, response.text
+        upload_requests = httpx_mock.get_requests(url=_files_url())
+        assert len(upload_requests) == 2
+        assert b'filename="0001_001.json"' in upload_requests[0].content
+        assert b'filename="0001_0001_001.json"' not in upload_requests[0].content
+        assert b'filename="0002_002.json"' in upload_requests[1].content
+
 
 # ---------------------------------------------------------------------------
 # 5. xsltproc missing from PATH -> 502, not a crash/hang.
@@ -290,7 +334,7 @@ class TestFailFastOnPartialUploadFailure:
 
         upload_calls = []
 
-        async def fake_upload_file(client_arg, file_path):
+        async def fake_upload_file(client_arg, file_path, upload_filename=None):
             upload_calls.append(file_path.name)
             if len(upload_calls) == 2:
                 request = httpx.Request("POST", _files_url())
@@ -350,7 +394,7 @@ class TestCallbackDeliveryFailure:
                 xml_file.with_suffix(".json").write_text("{}")
             return ConversionResult(stdout="", stderr="")
 
-        async def fake_upload_file(client_arg, file_path):
+        async def fake_upload_file(client_arg, file_path, upload_filename=None):
             return f"uploaded-{file_path.stem}"
 
         monkeypatch.setattr(main_module, "run_alto2anno", fake_run_alto2anno)
