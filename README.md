@@ -31,3 +31,13 @@ python alto2anno.py
 
 ## Output
 For each `*.xml` file, a matching `*.json` annotation file is created in the same directory. Canvas URI is derived from the sequence index in alphabetical order.
+
+## HTTP service
+
+`service/` contains a FastAPI wrapper that lets a Directus Flow trigger this
+conversion over HTTP (download ALTO files from Directus, run this CLI,
+upload the resulting annotation files back to Directus, then call back a
+webhook with the new file ids). This CLI itself is unchanged and still used
+as-is, invoked as a subprocess. See [`service/README.md`](service/README.md)
+for the endpoint contract, required environment variables, and how to run it
+locally or via Docker.

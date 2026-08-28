@@ -1,0 +1,7 @@
+-r requirements.txt
+
+# Test dependencies for service/tests/. Also needs `xsltproc` on PATH for
+# the real-conversion happy-path test (service/tests/test_convert.py) --
+# see service/README.md's own note about xsltproc.
+pytest>=8,<10
+pytest-httpx>=0.30,<1

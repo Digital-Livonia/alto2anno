@@ -1,0 +1,12 @@
+# Mac metadata files
+._*
+.DS_Store
+
+# Claude Code
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/

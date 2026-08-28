@@ -1,0 +1,12 @@
+.git
+._*
+.DS_Store
+.claude/
+build/
+dist/
+service/.venv/
+service/tests/
+service/requirements-dev.txt
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
