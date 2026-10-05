@@ -39,13 +39,28 @@ this service and whichever Flow calls it. Missing or wrong -> `401`.
 }
 ```
 
-- `alto_file_ids` is **ordered** — it must list the pages in the same order
-  they appear on the manifest's canvas sequence. `alto2anno.py` assigns each
-  page's canvas index by alphabetically sorting filenames in its working
-  directory, so this service downloads files and renames them with a
-  zero-padded prefix (`0001_...`, `0002_...`, ...) matching their position
-  in this list, to force that ordering regardless of each file's original
-  name in Directus. See `derive_filename` in `service/utils.py`.
+- `alto_file_ids` — the ALTO files to convert. **Their order does not decide
+  which canvas an annotation belongs to.** Each page's canvas number is its
+  position among the canvases of the manifest at `manifest_uri`, found by
+  matching the ALTO file's name to a canvas image name by *filename stem*
+  (everything before the first dot: `0003_003.xml` ↔ `0003_003.jpg`) — the
+  same rule `directus-iiif-endpoint` uses to attach an annotation file to a
+  canvas. So the list may be in any order and may cover only some pages
+  (page 3 stays canvas 3).
+  - The ALTO file's original name is read from Directus's
+    `Content-Disposition` header. The service renames files on disk with a
+    zero-padded prefix (`0001_...`, `0002_...`) only to keep names unique and
+    for the fallback below; see `derive_filename` in `service/utils.py`.
+  - **Fallback:** if the manifest cannot be fetched or has no canvas
+    filenames, the old behaviour applies (canvas number = position in
+    `alto_file_ids`, so the list must then be in page order). The response
+    says so (`canvas_order: "request"` and a warning).
+  - A file whose name matches no canvas is still converted, numbered after the
+    last canvas, and reported in `warnings` (it can't attach to any canvas).
+  - History: before this, the position in `alto_file_ids` always decided, and
+    a Flow that sent the ids in upload order shifted every annotation onto the
+    wrong canvas (magistraat 58: page 2's annotations on canvas 1, page 1's on
+    canvas 8).
 - `xratio` / `yratio` (optional, default `"1"`) — forwarded to `alto2anno.py`
   as-is.
 
@@ -57,9 +72,16 @@ On success, `200`:
 {
   "collection": "magistraat",
   "id": "47",
-  "annotation_file_ids": ["new-uuid1", "new-uuid2"]
+  "annotation_file_ids": ["new-uuid1", "new-uuid2"],
+  "canvas_order": "manifest",
+  "warnings": []
 }
 ```
+
+`canvas_order` is `"manifest"` (canvas numbers taken from the manifest) or
+`"request"` (fallback, see above). `warnings` lists anything worth a look,
+e.g. a file with no matching canvas. Neither field is sent in the callback
+body (Flow B still gets exactly `collection`, `id`, `annotation_file_ids`).
 
 This is also the exact body POSTed to `callback_url` (with
 `Authorization: Bearer <callback_token>`) before this response is returned

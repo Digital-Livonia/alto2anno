@@ -48,3 +48,20 @@ async def upload_file(client: httpx.AsyncClient, file_path: Path, upload_filenam
         )
     response.raise_for_status()
     return response.json()["data"]["id"]
+
+
+async def fetch_manifest(client: httpx.AsyncClient, manifest_uri: str) -> dict | None:
+    """GET the item's IIIF manifest (public, no auth). Returns the parsed JSON
+    object, or None on any network/HTTP/JSON problem or a non-object body.
+
+    Best effort on purpose: the manifest only supplies the canvas order for the
+    annotation files; if it is unreachable the caller falls back to the
+    request order (and reports that) instead of failing the whole conversion.
+    """
+    try:
+        response = await client.get(manifest_uri, timeout=settings.http_timeout_seconds)
+        response.raise_for_status()
+        data = response.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None

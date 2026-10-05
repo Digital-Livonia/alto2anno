@@ -17,6 +17,36 @@ import pytest
 from .conftest import FIXTURES_DIR
 
 DIRECTUS_URL = "https://directus.example.test"
+MANIFEST_URI = "https://db.dl.tlu.ee/iiif/manifest/magistraat/47"  # same as conftest.valid_payload
+
+
+class _ManifestStub:
+    """What the (mocked) manifest endpoint answers. Default: 404 -> the
+    service falls back to request order; tests call `.canvases()`/`.set()`."""
+
+    def __init__(self):
+        self.response = None  # None -> 404, else a (status, kwargs) pair
+
+    def canvases(self, *filenames):
+        items = [{"id": f"https://db.dl.tlu.ee/iiif/canvas/{i}", "filename": n} for i, n in enumerate(filenames, 1)]
+        self.response = (200, {"json": {"items": items}})
+
+    def raw(self, status_code, **kwargs):
+        self.response = (status_code, kwargs)
+
+
+@pytest.fixture(autouse=True)
+def manifest(httpx_mock):
+    stub = _ManifestStub()
+
+    def answer(request):
+        status, kwargs = stub.response or (404, {})
+        return httpx.Response(status, **kwargs)
+
+    # optional + reusable: tests that stop before the manifest fetch (auth,
+    # validation, download failures) must not fail for never requesting it.
+    httpx_mock.add_callback(answer, url=MANIFEST_URI, is_optional=True, is_reusable=True)
+    return stub
 
 
 def _asset_url(file_id: str) -> str:
@@ -176,7 +206,8 @@ class TestHappyPath:
 
         assert response.status_code == 200, response.text
         body = response.json()
-        assert body == {
+        assert body["canvas_order"] == "request"  # no usable manifest in this test
+        assert {k: body[k] for k in ("collection", "id", "annotation_file_ids")} == {
             "collection": "magistraat",
             "id": "47",
             "annotation_file_ids": uploaded_ids,
@@ -246,6 +277,152 @@ class TestHappyPath:
 
 
 # ---------------------------------------------------------------------------
+# 4b. Canvas numbers come from the manifest, not from the request order.
+#
+# Real bug (magistraat 58): the caller sent the ALTO ids as 0002..0008, 0001, so
+# every annotation file targeted the previous canvas and 0001's pointed at the
+# last one. Request order must not decide which canvas an annotation belongs to.
+# ---------------------------------------------------------------------------
+
+
+def _alto(httpx_mock, file_id, fixture, filename):
+    httpx_mock.add_response(
+        url=_asset_url(file_id),
+        content=(FIXTURES_DIR / fixture).read_bytes(),
+        headers={"content-disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _uploads_and_callback(httpx_mock, payload, n):
+    for i in range(n):
+        httpx_mock.add_response(url=_files_url(), method="POST", json={"data": {"id": f"new-{i + 1}"}})
+    httpx_mock.add_response(url=payload["callback_url"], method="POST", json={"ok": True})
+
+
+def _upload_for(httpx_mock, name):
+    for request in httpx_mock.get_requests(url=_files_url()):
+        if f'filename="{name}"'.encode() in request.content:
+            return request.content
+    raise AssertionError(f"no upload named {name}")
+
+
+class TestCanvasOrderFromManifest:
+    def test_annotations_target_the_canvas_of_their_own_page_whatever_the_request_order(
+        self, client, auth_headers, valid_payload, httpx_mock, manifest
+    ):
+        manifest.canvases("0001_001.jpg", "0002_002.jpg")
+        # page 2 listed first, page 1 last -- the order that shifted everything.
+        valid_payload["alto_file_ids"] = ["file-p2", "file-p1"]
+        _alto(httpx_mock, "file-p2", "sample_page_b.xml", "0002_002.xml")
+        _alto(httpx_mock, "file-p1", "sample_page_a.xml", "0001_001.xml")
+        _uploads_and_callback(httpx_mock, valid_payload, 2)
+
+        response = client.post("/convert", json=valid_payload, headers=auth_headers)
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["canvas_order"] == "manifest"
+        assert body["warnings"] == []
+        page2 = _upload_for(httpx_mock, "0002_002.json")
+        page1 = _upload_for(httpx_mock, "0001_001.json")
+        assert b"/iiif/canvas/2#xywh=" in page2 and b"/iiif/canvas/1#xywh=" not in page2
+        assert b"/iiif/canvas/1#xywh=" in page1 and b"/iiif/canvas/2#xywh=" not in page1
+
+    def test_callback_body_is_unchanged(self, client, auth_headers, valid_payload, httpx_mock, manifest):
+        # Flow B reads exactly these three keys; new response fields must not leak into it.
+        manifest.canvases("0001_001.jpg", "0002_002.jpg")
+        valid_payload["alto_file_ids"] = ["file-p2", "file-p1"]
+        _alto(httpx_mock, "file-p2", "sample_page_b.xml", "0002_002.xml")
+        _alto(httpx_mock, "file-p1", "sample_page_a.xml", "0001_001.xml")
+        _uploads_and_callback(httpx_mock, valid_payload, 2)
+
+        client.post("/convert", json=valid_payload, headers=auth_headers)
+
+        callback = httpx_mock.get_requests(url=valid_payload["callback_url"])[0]
+        assert json.loads(callback.content) == {
+            "collection": "magistraat",
+            "id": "47",
+            "annotation_file_ids": ["new-1", "new-2"],
+        }
+
+    def test_only_some_pages_keep_their_real_canvas_numbers(
+        self, client, auth_headers, valid_payload, httpx_mock, manifest
+    ):
+        manifest.canvases(*[f"{n:04d}_x.jpg" for n in range(1, 9)])
+        valid_payload["alto_file_ids"] = ["file-p3"]
+        _alto(httpx_mock, "file-p3", "sample_page_a.xml", "0003_x.xml")
+        _uploads_and_callback(httpx_mock, valid_payload, 1)
+
+        response = client.post("/convert", json=valid_payload, headers=auth_headers)
+
+        assert response.status_code == 200, response.text
+        content = _upload_for(httpx_mock, "0003_x.json")
+        assert b"/iiif/canvas/3#xywh=" in content  # not canvas/1 (its position in the request)
+
+    def test_uploaded_filenames_still_match_the_canvas_image_stems(
+        self, client, auth_headers, valid_payload, httpx_mock, manifest
+    ):
+        manifest.canvases("0001_001.jpg", "0002_002.jpg")
+        valid_payload["alto_file_ids"] = ["file-p2", "file-p1"]
+        _alto(httpx_mock, "file-p2", "sample_page_b.xml", "0002_002.xml")
+        _alto(httpx_mock, "file-p1", "sample_page_a.xml", "0001_001.xml")
+        _uploads_and_callback(httpx_mock, valid_payload, 2)
+
+        client.post("/convert", json=valid_payload, headers=auth_headers)
+
+        assert _upload_for(httpx_mock, "0002_002.json")
+        assert _upload_for(httpx_mock, "0001_001.json")
+
+    def test_file_without_a_matching_canvas_is_converted_and_reported(
+        self, client, auth_headers, valid_payload, httpx_mock, manifest
+    ):
+        manifest.canvases("0001_001.jpg", "0002_002.jpg")
+        valid_payload["alto_file_ids"] = ["file-p1", "file-stray"]
+        _alto(httpx_mock, "file-p1", "sample_page_a.xml", "0001_001.xml")
+        _alto(httpx_mock, "file-stray", "sample_page_b.xml", "stray.xml")
+        _uploads_and_callback(httpx_mock, valid_payload, 2)
+
+        response = client.post("/convert", json=valid_payload, headers=auth_headers)
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["canvas_order"] == "manifest"
+        assert any("stray" in w for w in body["warnings"])
+        assert b"/iiif/canvas/1#xywh=" in _upload_for(httpx_mock, "0001_001.json")
+        assert b"/iiif/canvas/3#xywh=" in _upload_for(httpx_mock, "stray.json")  # past the 2 canvases
+
+    @pytest.mark.parametrize(
+        "respond",
+        [
+            lambda m: None,  # 404 (the default)
+            lambda m: m.raw(500),
+            lambda m: m.raw(200, text="<html>not json</html>"),
+            lambda m: m.raw(200, json={"items": []}),
+            lambda m: m.raw(200, json={"items": [{"id": "https://x/canvas/1"}]}),  # no filenames
+        ],
+        ids=["404", "500", "not-json", "no-canvases", "no-filenames"],
+    )
+    def test_unusable_manifest_keeps_the_old_request_order_and_says_so(
+        self, client, auth_headers, valid_payload, httpx_mock, manifest, respond
+    ):
+        respond(manifest)
+        valid_payload["alto_file_ids"] = ["file-p2", "file-p1"]
+        _alto(httpx_mock, "file-p2", "sample_page_b.xml", "0002_002.xml")
+        _alto(httpx_mock, "file-p1", "sample_page_a.xml", "0001_001.xml")
+        _uploads_and_callback(httpx_mock, valid_payload, 2)
+
+        response = client.post("/convert", json=valid_payload, headers=auth_headers)
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["canvas_order"] == "request"
+        assert body["warnings"] and "request order" in body["warnings"][0].lower()
+        # legacy behaviour: position in the request decides
+        assert b"/iiif/canvas/1#xywh=" in _upload_for(httpx_mock, "0002_002.json")
+        assert b"/iiif/canvas/2#xywh=" in _upload_for(httpx_mock, "0001_001.json")
+
+
+# ---------------------------------------------------------------------------
 # 5. xsltproc missing from PATH -> 502, not a crash/hang.
 # ---------------------------------------------------------------------------
 
@@ -289,7 +466,7 @@ class TestPartialConversionOutput:
         import service.main as main_module
         from service.converter import ConversionResult
 
-        async def fake_run_alto2anno(directory, manifest_uri, xratio, yratio):
+        async def fake_run_alto2anno(directory, manifest_uri, xratio, yratio, index_map=None):
             # Simulate alto2anno.py's documented quirk: it exits 0 but
             # silently produced output for only one of the three inputs.
             xml_files = sorted(Path(directory).glob("*.xml"))
@@ -325,7 +502,7 @@ class TestFailFastOnPartialUploadFailure:
         import service.main as main_module
         from service.converter import ConversionResult
 
-        async def fake_run_alto2anno(directory, manifest_uri, xratio, yratio):
+        async def fake_run_alto2anno(directory, manifest_uri, xratio, yratio, index_map=None):
             for xml_file in Path(directory).glob("*.xml"):
                 xml_file.with_suffix(".json").write_text("{}")
             return ConversionResult(stdout="", stderr="")
@@ -389,7 +566,7 @@ class TestCallbackDeliveryFailure:
         import service.main as main_module
         from service.converter import ConversionResult
 
-        async def fake_run_alto2anno(directory, manifest_uri, xratio, yratio):
+        async def fake_run_alto2anno(directory, manifest_uri, xratio, yratio, index_map=None):
             for xml_file in Path(directory).glob("*.xml"):
                 xml_file.with_suffix(".json").write_text("{}")
             return ConversionResult(stdout="", stderr="")

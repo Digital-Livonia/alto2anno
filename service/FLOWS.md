@@ -35,7 +35,8 @@ here.
         v
 Flow A "Annotator: run alto2anno"  (trigger: manual, location: item)
   1. read_record   (item-read)   -- reads alto_files
-  2. build_payload (exec)        -- alto_files -> ordered alto_file_ids array
+  2. build_payload (exec)        -- alto_files -> alto_file_ids array (the order no longer
+                                     matters: canvas numbers come from the manifest, see README)
   3. send_request  (request)     -- POST http://<env>-alto2anno-service:8000/convert
                                      Authorization: Bearer ANNOTATOR_SHARED_SECRET
         |
