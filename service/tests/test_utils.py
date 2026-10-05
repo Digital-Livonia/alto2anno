@@ -6,7 +6,15 @@ the service_env fixture.
 """
 from __future__ import annotations
 
-from service.utils import derive_filename, filename_from_content_disposition, strip_index_prefix
+import pytest
+
+from service.utils import (
+    canvas_stem,
+    derive_filename,
+    filename_from_content_disposition,
+    plan_canvas_indices,
+    strip_index_prefix,
+)
 
 
 class TestFilenameFromContentDisposition:
@@ -123,3 +131,83 @@ class TestStripIndexPrefix:
 
     def test_no_op_when_no_prefix_present(self):
         assert strip_index_prefix("original") == "original"
+
+
+# ---------------------------------------------------------------------------
+# Canvas index from the manifest (the annotations-shifted-by-one bug).
+#
+# alto2anno.py used to assign each page's canvas number from the file's
+# position in the *request* (alto_file_ids). When the caller's list was not in
+# page order (e.g. the Flow reads the alto_files junction in upload order) every
+# annotation file targeted the wrong canvas. The canvas index now comes from
+# the manifest, matched by filename stem -- the same rule
+# directus-iiif-endpoint uses to attach an annotation file to a canvas.
+# ---------------------------------------------------------------------------
+
+def _manifest(*filenames):
+    return {"items": [{"id": f"https://x.test/iiif/canvas/{i}", "filename": name} for i, name in enumerate(filenames, 1)]}
+
+
+class TestCanvasStem:
+    @pytest.mark.parametrize(
+        "name, stem",
+        [
+            ("0001_001.jpg", "0001_001"),
+            ("0001_001.xml", "0001_001"),
+            ("page.1.json", "page"),  # up to the FIRST dot, like directus-iiif-endpoint
+            ("no_extension", "no_extension"),
+            ("/some/dir/0003_003.xml", "0003_003"),
+        ],
+    )
+    def test_stem_is_everything_before_the_first_dot(self, name, stem):
+        assert canvas_stem(name) == stem
+
+
+class TestPlanCanvasIndices:
+    def test_request_order_does_not_matter(self):
+        # The real bug: manifest order 0001..0008, request order 0002..0008, 0001.
+        stems = [f"000{n}_00{n}" for n in (2, 3, 4, 5, 6, 7, 8, 1)]
+        manifest = _manifest(*[f"000{n}_00{n}.jpg" for n in range(1, 9)])
+        indices, warnings = plan_canvas_indices(stems, manifest)
+        assert indices == [2, 3, 4, 5, 6, 7, 8, 1]
+        assert warnings == []
+
+    def test_subset_of_pages_keeps_their_real_canvas_numbers(self):
+        # ALTO only for pages 3 and 5: they are canvases 3 and 5, not 1 and 2.
+        manifest = _manifest(*[f"{n:04d}_x.jpg" for n in range(1, 9)])
+        indices, warnings = plan_canvas_indices(["0005_x", "0003_x"], manifest)
+        assert indices == [5, 3]
+        assert warnings == []
+
+    def test_unmatched_stem_gets_an_index_past_the_last_canvas_and_is_reported(self):
+        manifest = _manifest("a.jpg", "b.jpg")
+        indices, warnings = plan_canvas_indices(["b", "zzz", "a", "yyy"], manifest)
+        assert indices == [2, 3, 1, 4]  # unmatched: 3, 4 (after the 2 canvases), in request order
+        assert any("zzz" in w and "yyy" in w for w in warnings)
+
+    def test_unknown_original_filename_is_unmatched(self):
+        manifest = _manifest("a.jpg", "b.jpg")
+        indices, warnings = plan_canvas_indices([None, "b"], manifest)
+        assert indices == [3, 2]
+        assert warnings
+
+    def test_stem_shared_by_two_canvases_uses_the_first_and_warns(self):
+        manifest = _manifest("dup.jpg", "other.jpg", "dup.png")
+        indices, warnings = plan_canvas_indices(["dup", "other"], manifest)
+        assert indices == [1, 2]
+        assert any("dup" in w for w in warnings)
+
+    def test_same_stem_requested_twice_warns(self):
+        manifest = _manifest("a.jpg", "b.jpg")
+        indices, warnings = plan_canvas_indices(["a", "a"], manifest)
+        assert indices == [1, 1]
+        assert any("a" in w for w in warnings)
+
+    @pytest.mark.parametrize(
+        "manifest",
+        [None, {}, {"items": []}, {"items": [{"id": "x"}]}, {"items": "nope"}, [], "str", {"items": [None, 3]}],
+    )
+    def test_unusable_manifest_returns_none_so_the_caller_keeps_request_order(self, manifest):
+        indices, warnings = plan_canvas_indices(["a", "b"], manifest)
+        assert indices is None
+        assert warnings and "request order" in warnings[0].lower()

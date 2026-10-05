@@ -18,6 +18,7 @@ import logging
 import secrets
 import tempfile
 from pathlib import Path
+from typing import Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -28,8 +29,14 @@ from pydantic import BaseModel, Field, field_validator
 
 from .config import settings
 from .converter import ConversionError, run_alto2anno
-from .directus import fetch_asset, upload_file
-from .utils import derive_filename, strip_index_prefix
+from .directus import fetch_asset, fetch_manifest, upload_file
+from .utils import (
+    canvas_stem,
+    derive_filename,
+    filename_from_content_disposition,
+    plan_canvas_indices,
+    strip_index_prefix,
+)
 
 logger = logging.getLogger("alto2anno.service")
 
@@ -80,6 +87,13 @@ class ConvertResponse(BaseModel):
     collection: str
     id: str
     annotation_file_ids: list[str]
+    # How each annotation's canvas number was chosen: "manifest" = the page's
+    # real position among the manifest's canvases (matched by filename stem),
+    # "request" = legacy fallback, the file's position in alto_file_ids (used
+    # when the manifest is unusable). `warnings` lists anything worth a look,
+    # e.g. a file with no matching canvas. Not part of the callback body.
+    canvas_order: Literal["manifest", "request"] = "request"
+    warnings: list[str] = []
 
 
 @app.exception_handler(RequestValidationError)
@@ -106,10 +120,13 @@ async def convert(payload: ConvertRequest) -> ConvertResponse:
         with tempfile.TemporaryDirectory(prefix="alto2anno-") as tmp:
             tmp_path = Path(tmp)
 
-            # Downloaded in request order; filenames are prefixed with their
-            # position so alto2anno.py's alphabetical sort preserves that
-            # order when assigning canvas indices. See utils.derive_filename.
+            # Downloaded in request order. Filenames are prefixed with their
+            # position (unique names, and the legacy canvas order when the
+            # manifest cannot be used; see utils.derive_filename). Which canvas
+            # each file belongs to is decided below from the manifest.
             input_stems: list[str] = []
+            disk_filenames: list[str] = []
+            original_stems: list[str | None] = []
             for index, file_id in enumerate(payload.alto_file_ids, start=1):
                 try:
                     response = await fetch_asset(client, file_id)
@@ -120,12 +137,37 @@ async def convert(payload: ConvertRequest) -> ConvertResponse:
                         detail=f"Failed to download ALTO file '{file_id}' from Directus.",
                     ) from exc
 
-                filename = derive_filename(index, file_id, response.headers.get("content-disposition"))
+                disposition = response.headers.get("content-disposition")
+                filename = derive_filename(index, file_id, disposition)
                 (tmp_path / filename).write_bytes(response.content)
                 input_stems.append(Path(filename).stem)
+                disk_filenames.append(filename)
+                original = filename_from_content_disposition(disposition)
+                original_stems.append(canvas_stem(original) if original else None)
+
+            # Canvas number = the page's position among the manifest's canvases,
+            # matched by filename stem (the same rule directus-iiif-endpoint uses
+            # to attach an annotation file to a canvas). The request order is NOT
+            # trustworthy: the Flow reads the alto_files junction, typically in
+            # upload order, and a shuffled list shifted every annotation onto the
+            # wrong canvas. Falls back to request order if the manifest is unusable.
+            manifest = await fetch_manifest(client, payload.manifest_uri)
+            if manifest is None:
+                indices = None
+                warnings = [
+                    f"Could not fetch the manifest ({payload.manifest_uri}); "
+                    "using request order for canvas numbers."
+                ]
+            else:
+                indices, warnings = plan_canvas_indices(original_stems, manifest)
+            for warning in warnings:
+                logger.warning("convert %s/%s: %s", payload.collection, payload.id, warning)
+            index_map = dict(zip(disk_filenames, indices)) if indices else None
 
             try:
-                await run_alto2anno(tmp_path, payload.manifest_uri, payload.xratio, payload.yratio)
+                await run_alto2anno(
+                    tmp_path, payload.manifest_uri, payload.xratio, payload.yratio, index_map
+                )
             except ConversionError as exc:
                 logger.error("alto2anno.py failed: %s", exc)
                 raise HTTPException(status_code=502, detail="ALTO to annotation conversion failed.") from exc
@@ -195,5 +237,9 @@ async def convert(payload: ConvertRequest) -> ConvertResponse:
                 ) from exc
 
     return ConvertResponse(
-        collection=payload.collection, id=payload.id, annotation_file_ids=annotation_file_ids
+        collection=payload.collection,
+        id=payload.id,
+        annotation_file_ids=annotation_file_ids,
+        canvas_order="manifest" if index_map else "request",
+        warnings=warnings,
     )

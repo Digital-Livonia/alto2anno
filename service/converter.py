@@ -11,7 +11,9 @@ themselves (main.py does this after calling this function).
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,26 +30,44 @@ class ConversionResult:
     stderr: str
 
 
-async def run_alto2anno(directory: Path, manifest_uri: str, xratio: str, yratio: str) -> ConversionResult:
+async def run_alto2anno(
+    directory: Path,
+    manifest_uri: str,
+    xratio: str,
+    yratio: str,
+    index_map: dict[str, int] | None = None,
+) -> ConversionResult:
+    """Run alto2anno.py on `directory`.
+
+    `index_map` (filename -> canvas index) tells the script which canvas each
+    file belongs to; without it the script numbers files by alphabetical
+    position. The map goes in a temp file outside `directory` (the script only
+    reads *.xml there, and the results must not pick up stray files).
+    """
     if shutil.which("xsltproc") is None:
         raise ConversionError("xsltproc is not installed or not on PATH.")
 
-    command = [
-        settings.python_executable,
-        str(settings.alto2anno_script),
-        "-d", str(directory),
-        "-x", str(settings.xsl_path),
-        "-m", manifest_uri,
-        "--xratio", xratio,
-        "--yratio", yratio,
-    ]
+    with tempfile.TemporaryDirectory(prefix="alto2anno-map-") as map_dir:
+        command = [
+            settings.python_executable,
+            str(settings.alto2anno_script),
+            "-d", str(directory),
+            "-x", str(settings.xsl_path),
+            "-m", manifest_uri,
+            "--xratio", xratio,
+            "--yratio", yratio,
+        ]
+        if index_map:
+            map_path = Path(map_dir) / "index_map.json"
+            map_path.write_text(json.dumps(index_map), encoding="utf-8")
+            command += ["--index-map", str(map_path)]
 
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout_bytes, stderr_bytes = await process.communicate()
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, stderr_bytes = await process.communicate()
     stdout = stdout_bytes.decode("utf-8", errors="replace")
     stderr = stderr_bytes.decode("utf-8", errors="replace")
 
